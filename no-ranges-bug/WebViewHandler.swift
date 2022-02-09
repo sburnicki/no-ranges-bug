@@ -25,27 +25,30 @@ class WebViewHander: NSObject, WKURLSchemeHandler {
         do {
           let fileHandle = try FileHandle(forReadingFrom: fileUrl)
           let mimeType = mimeTypeForExtension(pathExtension: url.pathExtension)
+          let optionalRangeHeader = urlSchemeTask.request.value(forHTTPHeaderField: "Range")
           var headers =  [
             "Content-Type": mimeType,
           ]
-          if isMediaExtension(pathExtension: url.pathExtension) {
-              let expectedContentLength = try fileUrl.resourceValues(forKeys: [.fileSizeKey]).fileSize!
-              let range = chunkRange(ofHeaderValue: urlSchemeTask.request.value(forHTTPHeaderField: "Range") ?? "", totalLength: expectedContentLength)
-              let requestedContentLength = range.1 - range.0 + 1 // end index is inclusive per standard
-              try fileHandle.seek(toOffset: UInt64(range.0))
-              let data = fileHandle.readData(ofLength: requestedContentLength)
-              
-              headers["Content-Range"] = "bytes \(String(range.0))-\(String(range.1))/\(String(expectedContentLength))"
-              headers["Accept-Ranges"] = "bytes"
-              headers["Content-Length"] = String(data.count)
-              print("Sending headers \(String(describing: headers))")
-              urlSchemeTask.didReceive(HTTPURLResponse(url: localUrl, statusCode: 206, httpVersion: nil, headerFields: headers)!)
-              urlSchemeTask.didReceive(data)
+          let data: Data
+          var statusCode = 200
+          if optionalRangeHeader != nil && isMediaExtension(pathExtension: url.pathExtension) {
+            let expectedContentLength = try fileUrl.resourceValues(forKeys: [.fileSizeKey]).fileSize!
+            let range = chunkRange(ofHeaderValue: optionalRangeHeader!, totalLength: expectedContentLength)
+            let requestedContentLength = range.1 - range.0 + 1 // end index is inclusive per standard
+            try fileHandle.seek(toOffset: UInt64(range.0))
+            data = fileHandle.readData(ofLength: requestedContentLength)
+            statusCode = 206
+            headers["Content-Range"] = "bytes \(String(range.0))-\(String(range.1))/\(String(expectedContentLength))"
+            headers["Accept-Ranges"] = "bytes"
+            headers["Content-Length"] = String(data.count)
+            print("Sending headers \(String(describing: headers))")
           } else {
-              let httpResponse = HTTPURLResponse(url: localUrl, statusCode: 200, httpVersion: nil, headerFields: headers)
-              urlSchemeTask.didReceive(httpResponse!)
-              urlSchemeTask.didReceive(fileHandle.readDataToEndOfFile())
+            data = fileHandle.readDataToEndOfFile()
+            headers["Content-Length"] = String(data.count)
           }
+          let response = HTTPURLResponse(url: localUrl, statusCode: statusCode, httpVersion: nil, headerFields: headers)
+          urlSchemeTask.didReceive(response!)
+          urlSchemeTask.didReceive(data)
           try fileHandle.close()
         } catch let error as NSError {
           urlSchemeTask.didFailWithError(error)
@@ -64,11 +67,8 @@ class WebViewHander: NSObject, WKURLSchemeHandler {
     
         let index = rangeHeader.index(rangeHeader.startIndex, offsetBy: prefix.count)
         let parts = String(rangeHeader[index...]).split(separator: "-", maxSplits: 1).map({ Int($0)})
-        if (parts.count != 2 || parts[0] == nil || parts[1] == nil) {
-            print("invalid range header, couldn't parse start and end")
-            return (0, length)
-        }
-        return (parts[0] ?? 0, parts[1] ?? length)
+        let end = parts.count > 1 && parts[1] != nil ? parts[1]! : length
+        return (parts[0] ?? 0, end)
     }
 
   func webView(_ webView: WKWebView, stop urlSchemeTask: WKURLSchemeTask) {
